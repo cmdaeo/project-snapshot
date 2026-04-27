@@ -1,0 +1,95 @@
+{
+  "name": "project-snapshot",
+  "displayName": "Project Snapshot",
+  "description": "Generate an LLM-optimized snapshot of your project structure and file contents",
+  "version": "1.1.0",
+  "publisher": "cmdaeo",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "project-snapshot.generate",
+        "title": "Generate Project Snapshot"
+      },
+      {
+        "command": "project-snapshot.openInNewWindow",
+        "title": "Open in New Window"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "project-snapshot.generate",
+          "group": "navigation@7",
+          "when": "explorerResourceIsFolder || !explorerResourceIsFolder"
+        },
+        {
+          "command": "project-snapshot.openInNewWindow",
+          "group": "navigation",
+          "when": "explorerResourceIsFolder || explorerResourceIsFile"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "project-snapshot.generate",
+          "group": "navigation@7"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "project-snapshot.generate"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Project Snapshot",
+      "properties": {
+        "projectSnapshot.globalIgnores": {
+          "type": "array",
+          "default": [
+            "node_modules/**",
+            ".venv/**",
+            "deps/**",
+            ".vsix",
+            ".git/**",
+            "out/**",
+            "dist/**",
+            "build/**",
+            ".vscode/**"
+          ],
+          "description": "Global ignore patterns. Evaluated in order. Supports '*' (ignore all) and '!.ext' (un-ignore). Example: ['*', '!.js'] ignores everything EXCEPT JS files."
+        },
+        "projectSnapshot.includedExtensions": {
+          "type": "array",
+          "default": [
+            "*"
+          ],
+          "description": "Allowed file extensions (e.g. ['.ts', '.json']). Leave as ['*'] to allow all files that aren't blocked by globalIgnores."
+        },
+        "projectSnapshot.notificationTimeout": {
+          "type": "number",
+          "default": 15000,
+          "description": "Timeout in milliseconds for auto-dismissing information notifications. Set to 0 to disable auto-dismissal."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^6.0.3"
+  }
+}
