@@ -71,6 +71,28 @@ export function activate(context: vscode.ExtensionContext) {
             }
         )
     );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand(
+            'project-snapshot.openInNewWindow',
+            async (uri: vscode.Uri, selectedUris: vscode.Uri[]) => {
+                if (selectedUris && selectedUris.length > 1) {
+                    return;
+                }
+
+                if (!uri) { return; }
+
+                const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+                const isRoot = workspaceFolder && workspaceFolder.uri.fsPath === uri.fsPath;
+
+                if (isRoot) { return; }
+
+                await vscode.commands.executeCommand('vscode.openFolder', uri, { 
+                    forceNewWindow: true 
+                });
+            }
+        )
+    );
 }
 
 // ─── Main Snapshot Logic ──────────────────────────────────────────────────────

@@ -2,8 +2,10 @@
   "name": "project-snapshot",
   "displayName": "Project Snapshot",
   "description": "Generate an LLM-optimized snapshot of your project structure and file contents",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "cmdaeo",
+  "license": "MIT",
+  "repository": "https://github.com/cmdaeo/project-snapshot",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -32,8 +34,8 @@
         },
         {
           "command": "project-snapshot.openInNewWindow",
-          "group": "navigation",
-          "when": "explorerResourceIsFolder || explorerResourceIsFile"
+          "group": "navigation@8",
+          "when": "!listMultiSelection && (explorerResourceIsFolder || !explorerResourceIsFolder)"
         }
       ],
       "editor/context": [
