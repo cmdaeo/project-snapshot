@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { exec } from 'child_process';
+import ignore from 'ignore';
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -20,78 +21,249 @@ interface FileEntry {
     fullPath: string;
 }
 
-// ─── Ignore Engine ────────────────────────────────────────────────────────────
+interface PortProcess {
+    port: number;
+    pid: number;
+    name: string;
+}
 
-class IgnoreEngine {
-    private rules: { regex: RegExp; negate: boolean }[] = [];
+// ─── Settings Provider (Sidebar UI) ───────────────────────────────────────────
 
-    constructor(patterns: string[]) {
-        for (let p of patterns) {
-            p = p.trim();
-            if (!p || p.startsWith('#')) { continue; }
+class SnapshotConfigProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    private _onDidChangeTreeData: vscode.EventEmitter<vscode.TreeItem | undefined | void> = new vscode.EventEmitter<vscode.TreeItem | undefined | void>();
+    readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | void> = this._onDidChangeTreeData.event;
 
-            let negate = false;
-            if (p.startsWith('!')) {
-                negate = true;
-                p = p.substring(1);
-            }
-
-            let regexStr = p
-                .replace(/\./g, '\\.')
-                .replace(/\*\*/g, '.*')
-                .replace(/\*/g, '[^/]*')
-                .replace(/\?/g, '[^/]');
-
-            regexStr = (p.startsWith('/') ? '^' + regexStr.substring(1) : '(^|/)' + regexStr) + '($|/)';
-
-            this.rules.push({ regex: new RegExp(regexStr), negate });
-        }
+    refresh(): void {
+        this._onDidChangeTreeData.fire();
     }
 
-    public isIgnored(relativePath: string): boolean {
-        let ignored = false;
-        for (const rule of this.rules) {
-            if (rule.regex.test(relativePath)) {
-                ignored = !rule.negate;
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+
+    getChildren(element?: vscode.TreeItem): Thenable<vscode.TreeItem[]> {
+        if (element) { return Promise.resolve([]); }
+
+        const config = vscode.workspace.getConfiguration('projectSnapshot');
+        const includeTree = config.get<boolean>('includeDirectoryTree') ?? true;
+        const includeContents = config.get<boolean>('includeFileContents') ?? true;
+
+        const generateItem = new vscode.TreeItem('Generate Snapshot', vscode.TreeItemCollapsibleState.None);
+        generateItem.iconPath = new vscode.ThemeIcon('play');
+        generateItem.command = { command: 'project-snapshot.generate', title: 'Generate' };
+
+        const toggleTreeItem = new vscode.TreeItem(`Include Tree: ${includeTree ? 'ON' : 'OFF'}`, vscode.TreeItemCollapsibleState.None);
+        toggleTreeItem.iconPath = new vscode.ThemeIcon(includeTree ? 'check' : 'close');
+        toggleTreeItem.command = { command: 'project-snapshot.toggleTree', title: 'Toggle Tree' };
+
+        const toggleContentsItem = new vscode.TreeItem(`Include Contents: ${includeContents ? 'ON' : 'OFF'}`, vscode.TreeItemCollapsibleState.None);
+        toggleContentsItem.iconPath = new vscode.ThemeIcon(includeContents ? 'check' : 'close');
+        toggleContentsItem.command = { command: 'project-snapshot.toggleContents', title: 'Toggle Contents' };
+
+        const settingsItem = new vscode.TreeItem('Edit Ignore Rules', vscode.TreeItemCollapsibleState.None);
+        settingsItem.iconPath = new vscode.ThemeIcon('settings-gear');
+        settingsItem.command = { command: 'project-snapshot.openSettings', title: 'Settings' };
+
+        return Promise.resolve([generateItem, toggleTreeItem, toggleContentsItem, settingsItem]);
+    }
+}
+
+// ─── Port Manager Provider ────────────────────────────────────────────────────
+
+// Custom TreeItem to natively hold the PID without breaking left-clicks
+class PortTreeItem extends vscode.TreeItem {
+    constructor(
+        public readonly port: number,
+        public readonly pid: number,
+        public readonly processName: string
+    ) {
+        super(`Port ${port}`, vscode.TreeItemCollapsibleState.None);
+        this.description = `${processName} (PID: ${pid})`;
+        this.iconPath = new vscode.ThemeIcon('radio-tower');
+        this.contextValue = 'portItem';
+        this.tooltip = `Running process: ${processName} on PID ${pid}`;
+    }
+}
+
+async function getProcessDetailsFromPid(pid: number): Promise<string> {
+    return new Promise((resolve) => {
+        const isWin = os.platform() === 'win32';
+        const cmd = isWin 
+            ? `wmic process where processid=${pid} get commandline` 
+            : `ps -p ${pid} -o command=`;
+
+        exec(cmd, (err, stdout) => {
+            if (err || !stdout.trim()) { return resolve('Unknown Process'); }
+
+            let detail = stdout.trim();
+            
+            if (isWin) {
+                const lines = detail.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+                detail = lines.length > 1 ? lines[1] : lines[0];
             }
+
+            if (!detail) { return resolve('Unknown Process'); }
+
+            if (detail.toLowerCase().includes('node') || detail.includes('Code Helper') || detail.includes('python')) {
+                const fileMatch = detail.match(/([a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+)(?:\s|$)/g);
+                if (fileMatch && fileMatch.length > 0) {
+                    const scriptName = fileMatch[fileMatch.length - 1].trim();
+                    return resolve(`Running: ${scriptName}`);
+                }
+            }
+
+            if (detail.length > 40) {
+                detail = detail.substring(0, 37) + '...';
+            }
+
+            resolve(detail);
+        });
+    });
+}
+
+function getOpenPorts(): Promise<PortProcess[]> {
+    return new Promise((resolve) => {
+        const isWin = os.platform() === 'win32';
+        const cmd = isWin ? 'netstat -ano | findstr LISTENING' : 'lsof -iTCP -sTCP:LISTEN -n -P';
+        
+        exec(cmd, (err, stdout) => {
+            if (err) { return resolve([]); }
+            
+            const results: PortProcess[] = [];
+            const lines = stdout.split('\n');
+            
+            for (const line of lines) {
+                if (isWin) {
+                    const match = line.match(/TCP\s+[^\s]+:(\d+)\s+[^\s]+\s+LISTENING\s+(\d+)/);
+                    if (match) {
+                        results.push({ port: parseInt(match[1]), pid: parseInt(match[2]), name: 'Process' });
+                    }
+                } else {
+                    const match = line.match(/^([^\s]+)\s+(\d+).*?:(\d+)\s+\(LISTEN\)/);
+                    if (match) {
+                        results.push({ name: match[1], pid: parseInt(match[2]), port: parseInt(match[3]) });
+                    }
+                }
+            }
+            
+            const unique = Array.from(new Map(results.map(p => [p.port, p])).values());
+            
+            // Enrich basic names with detailed command line scripts
+            Promise.all(unique.map(async (p) => {
+                const detailName = await getProcessDetailsFromPid(p.pid);
+                return { 
+                    ...p, 
+                    name: detailName !== 'Unknown Process' ? detailName : p.name 
+                };
+            })).then(enrichedPorts => {
+                resolve(enrichedPorts.sort((a, b) => a.port - b.port));
+            });
+        });
+    });
+}
+
+class PortManagerProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    private _onDidChangeTreeData: vscode.EventEmitter<vscode.TreeItem | undefined | void> = new vscode.EventEmitter<vscode.TreeItem | undefined | void>();
+    readonly onDidChangeTreeData: vscode.Event<vscode.TreeItem | undefined | void> = this._onDidChangeTreeData.event;
+
+    refresh(): void {
+        this._onDidChangeTreeData.fire();
+    }
+
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+
+    async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+        if (element) { return []; }
+
+        const ports = await getOpenPorts();
+        
+        if (ports.length === 0) {
+            const emptyItem = new vscode.TreeItem('No active ports found', vscode.TreeItemCollapsibleState.None);
+            emptyItem.iconPath = new vscode.ThemeIcon('info');
+            return [emptyItem];
         }
-        return ignored;
+
+        return ports.map(p => new PortTreeItem(p.port, p.pid, p.name));
     }
 }
 
 // ─── Activation ───────────────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext) {
-    context.subscriptions.push(
-        vscode.commands.registerCommand(
-            'project-snapshot.generate',
-            async (uri: vscode.Uri, selectedUris: vscode.Uri[]) => {
-                const targets = selectedUris?.length > 0 ? selectedUris : uri ? [uri] : [];
-                await generateSnapshot(targets);
-            }
-        )
-    );
+    // 1. Setup Providers
+    const configProvider = new SnapshotConfigProvider();
+    vscode.window.registerTreeDataProvider('project-snapshot.configView', configProvider);
 
+    const portProvider = new PortManagerProvider();
+    vscode.window.registerTreeDataProvider('project-snapshot.portView', portProvider);
+
+    // Refresh UI automatically if settings change
+    vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('projectSnapshot')) {
+            configProvider.refresh();
+        }
+    });
+
+    // 2. Register Commands
     context.subscriptions.push(
-        vscode.commands.registerCommand(
-            'project-snapshot.openInNewWindow',
-            async (uri: vscode.Uri, selectedUris: vscode.Uri[]) => {
-                if (selectedUris && selectedUris.length > 1) {
-                    return;
+        vscode.commands.registerCommand('project-snapshot.generate', async (uri?: vscode.Uri, selectedUris?: vscode.Uri[]) => {
+            const targets = selectedUris?.length ? selectedUris : uri ? [uri] : [];
+            await generateSnapshot(targets);
+        }),
+
+        vscode.commands.registerCommand('project-snapshot.openInNewWindow', async (uri: vscode.Uri, selectedUris: vscode.Uri[]) => {
+            if (selectedUris && selectedUris.length > 1) { return; }
+            if (!uri) { return; }
+
+            const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+            const isRoot = workspaceFolder && workspaceFolder.uri.fsPath === uri.fsPath;
+            if (isRoot) { return; }
+
+            await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
+        }),
+
+        vscode.commands.registerCommand('project-snapshot.openSettings', () => {
+            vscode.commands.executeCommand('workbench.action.openSettings', 'projectSnapshot.globalIgnores');
+        }),
+
+        vscode.commands.registerCommand('project-snapshot.toggleTree', async () => {
+            const config = vscode.workspace.getConfiguration('projectSnapshot');
+            const current = config.get<boolean>('includeDirectoryTree') ?? true;
+            await config.update('includeDirectoryTree', !current, vscode.ConfigurationTarget.Global);
+        }),
+
+        vscode.commands.registerCommand('project-snapshot.toggleContents', async () => {
+            const config = vscode.workspace.getConfiguration('projectSnapshot');
+            const current = config.get<boolean>('includeFileContents') ?? true;
+            await config.update('includeFileContents', !current, vscode.ConfigurationTarget.Global);
+        }),
+
+        vscode.commands.registerCommand('project-snapshot.refreshPorts', () => {
+            portProvider.refresh();
+        }),
+
+        // Updated killPort command taking the PortTreeItem class
+        vscode.commands.registerCommand('project-snapshot.killPort', async (treeItem: PortTreeItem) => {
+            const pid = treeItem.pid;
+            if (!pid) { return; }
+
+            const confirm = await vscode.window.showWarningMessage(`Kill process ${pid}?`, { modal: true }, 'Yes', 'No');
+            if (confirm !== 'Yes') { return; }
+
+            const isWin = os.platform() === 'win32';
+            const cmd = isWin ? `taskkill /F /PID ${pid}` : `kill -9 ${pid}`;
+
+            exec(cmd, (err) => {
+                if (err) {
+                    vscode.window.showErrorMessage(`Failed to kill PID ${pid}: ${err.message}`);
+                } else {
+                    vscode.window.showInformationMessage(`Successfully killed PID ${pid}`);
+                    portProvider.refresh();
                 }
-
-                if (!uri) { return; }
-
-                const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
-                const isRoot = workspaceFolder && workspaceFolder.uri.fsPath === uri.fsPath;
-
-                if (isRoot) { return; }
-
-                await vscode.commands.executeCommand('vscode.openFolder', uri, { 
-                    forceNewWindow: true 
-                });
-            }
-        )
+            });
+        })
     );
 }
 
@@ -110,7 +282,14 @@ async function generateSnapshot(targets: vscode.Uri[]) {
     const config = vscode.workspace.getConfiguration('projectSnapshot');
     const globalIgnores   = config.get<string[]>('globalIgnores') || [];
     const includedExts    = config.get<string[]>('includedExtensions') || ['*'];
-    const ignoreEngine    = new IgnoreEngine(globalIgnores);
+    
+    // Normalize ignores: strip "/**" to leave trailing slashes for standard gitignore matching
+    const normalizedIgnores = globalIgnores.map(p => {
+        const trimmed = p.trim();
+        return trimmed.endsWith('/**') ? trimmed.slice(0, -2) : trimmed;
+    });
+    const ig = ignore().add(normalizedIgnores);
+    
     const includeAllExts  = includedExts.includes('*');
     const allowedExts     = new Set(includedExts.map(e => e.toLowerCase()));
 
@@ -124,7 +303,6 @@ async function generateSnapshot(targets: vscode.Uri[]) {
                 await withTimeout((async () => {
                     progress.report({ increment: 10, message: 'Scanning...' });
 
-                    // ── Separate dirs from files upfront ──────────────────────
                     const dirTargets:  vscode.Uri[] = [];
                     const fileTargets: vscode.Uri[] = [];
 
@@ -133,32 +311,23 @@ async function generateSnapshot(targets: vscode.Uri[]) {
                         (stat.isDirectory() ? dirTargets : fileTargets).push(t);
                     }));
 
-                    // ── Single-pass scan: tree + file collection together ─────
                     const treeParts: string[] = [];
                     const allFiles:  FileEntry[] = [];
 
-                    // Lone files (not inside a selected dir)
                     for (const t of fileTargets) {
                         const rel = path.relative(workspaceRoot, t.fsPath).replace(/\\/g, '/');
-                        if (!ignoreEngine.isIgnored(rel)) {
+                        if (!ig.ignores(rel)) {
                             treeParts.push(`${rel}\n`);
                             allFiles.push({ relativePath: rel, fullPath: t.fsPath });
                         }
                     }
 
-                    // Directories — scan in parallel
-                    const dirResults = await Promise.all(
-                        dirTargets.map(t =>
-                            scanDirectory(t.fsPath, workspaceRoot, ignoreEngine, includeAllExts, allowedExts)
-                        )
-                    );
-
-                    for (const r of dirResults) {
+                    for (const t of dirTargets) {
+                        const r = await scanDirectory(t.fsPath, workspaceRoot, ig, includeAllExts, allowedExts);
                         treeParts.push(r.tree);
                         allFiles.push(...r.files);
                     }
 
-                    // Deduplicate by fullPath
                     const uniqueFiles = Array.from(
                         new Map(allFiles.map(f => [f.fullPath, f])).values()
                     );
@@ -167,23 +336,39 @@ async function generateSnapshot(targets: vscode.Uri[]) {
                     const fileContents = await generateFileContents(uniqueFiles, progress);
 
                     progress.report({ increment: 10, message: 'Writing...' });
-                    const snapshot =
-                        '==================== PROJECT DIRECTORY STRUCTURE ====================\n\n' +
-                        treeParts.join('') +
-                        '\n\n==================== FILE CONTENTS ====================\n\n' +
-                        fileContents;
+                    
+                    const includeTree = config.get<boolean>('includeDirectoryTree') ?? true;
+                    const includeContents = config.get<boolean>('includeFileContents') ?? true;
+
+                    let snapshot = '';
+
+                    if (includeTree) {
+                        snapshot += '==================== PROJECT DIRECTORY STRUCTURE ====================\n\n' + treeParts.join('');
+                    }
+
+                    if (includeContents) {
+                        snapshot += (snapshot.length > 0 ? '\n\n' : '') + '==================== FILE CONTENTS ====================\n\n' + fileContents;
+                    }
+
+                    if (!includeTree && !includeContents) {
+                        snapshot = "Snapshot generated with both Tree and Contents disabled.";
+                    }
 
                     const rootFolderName = path.basename(workspaceRoot);
                     const tempFilePath   = path.join(os.tmpdir(), `${rootFolderName}-schema.md`);
                     await fs.promises.writeFile(tempFilePath, snapshot, 'utf-8');
 
-                    // ── Clipboard ─────────────────────────────────────────────
                     let copyMethod = 'File';
                     try {
                         await copyNativeFileToClipboard(tempFilePath);
                     } catch {
-                        await vscode.env.clipboard.writeText(tempFilePath);
-                        copyMethod = 'Path';
+                        if (snapshot.length < 5000000) { 
+                            await vscode.env.clipboard.writeText(snapshot);
+                            copyMethod = 'Content';
+                        } else {
+                            await vscode.env.clipboard.writeText(tempFilePath);
+                            copyMethod = 'Path (File too large for text clipboard)';
+                        }
                     }
 
                     const successMsg = `${copyMethod} copied! (${uniqueFiles.length} files)`;
@@ -210,7 +395,7 @@ async function generateSnapshot(targets: vscode.Uri[]) {
 async function scanDirectory(
     dirPath:       string,
     rootPath:      string,
-    ignoreEngine:  IgnoreEngine,
+    ig:            any,
     includeAllExts: boolean,
     allowedExts:   Set<string>
 ): Promise<{ tree: string; files: FileEntry[] }> {
@@ -226,17 +411,17 @@ async function scanDirectory(
 
         const valid = entries.filter((e: fs.Dirent) => {
             const rel = path.relative(rootPath, path.join(dir, e.name)).replace(/\\/g, '/');
-            return !ignoreEngine.isIgnored(e.isDirectory() ? rel + '/' : rel);
+            const checkPath = e.isDirectory() ? rel + '/' : rel;
+            return !ig.ignores(checkPath);
         });
 
         const dirs  = valid.filter((e: fs.Dirent) => e.isDirectory() ).sort((a, b) => a.name.localeCompare(b.name));
         const fents = valid.filter((e: fs.Dirent) => e.isFile()      ).sort((a, b) => a.name.localeCompare(b.name));
 
-        // Subdirectories — recurse in parallel
-        await Promise.all(dirs.map(async (e) => {
+        for (const e of dirs) {
             treeParts.push(`${indent}${e.name}/\n`);
             await walk(path.join(dir, e.name), level + 1);
-        }));
+        }
 
         for (const e of fents) {
             treeParts.push(`${indent}${e.name}\n`);
@@ -265,12 +450,22 @@ async function generateFileContents(
 ): Promise<string> {
     const results: string[] = new Array(files.length);
     const total = files.length;
+    
+    const config = vscode.workspace.getConfiguration('projectSnapshot');
+    const maxSizeBytes = (config.get<number>('maxFileSizeKB') || 1000) * 1024;
 
     for (let i = 0; i < total; i += READ_CONCURRENCY) {
         const batch = files.slice(i, i + READ_CONCURRENCY);
         await Promise.all(batch.map(async (file, j) => {
             const idx = i + j;
             try {
+                const stat = await fs.promises.stat(file.fullPath);
+                
+                if (stat.size > maxSizeBytes) {
+                    results[idx] = `<file path="${file.relativePath}">\n[File skipped: Exceeds size limit of ${Math.round(stat.size / 1024)}KB]\n</file>\n\n`;
+                    return;
+                }
+
                 const content = await fs.promises.readFile(file.fullPath, 'utf-8');
                 const lang    = path.extname(file.relativePath).substring(1).toLowerCase() || 'text';
                 results[idx]  =
@@ -302,11 +497,9 @@ function copyNativeFileToClipboard(filePath: string): Promise<void> {
         let command: string;
 
         if (platform === 'win32') {
-            // Escape single quotes for PowerShell string literal
             const escaped = filePath.replace(/'/g, "''");
             command = `powershell.exe -STA -NoProfile -NonInteractive -Command "Get-Item -LiteralPath '${escaped}' | Set-Clipboard"`;
         } else if (platform === 'darwin') {
-            // Escape backslashes and double quotes for AppleScript
             const escaped = filePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
             command = `osascript -e 'set the clipboard to POSIX file "${escaped}"'`;
         } else {

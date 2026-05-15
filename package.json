@@ -2,7 +2,7 @@
   "name": "project-snapshot",
   "displayName": "Project Snapshot",
   "description": "Generate an LLM-optimized snapshot of your project structure and file contents",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "publisher": "cmdaeo",
   "license": "MIT",
   "repository": "https://github.com/cmdaeo/project-snapshot",
@@ -12,9 +12,34 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "projectSnapshotContainer",
+          "title": "Project Snapshot",
+          "icon": "resources/camera.svg"
+        }
+      ]
+    },
+    "views": {
+      "projectSnapshotContainer": [
+        {
+          "id": "project-snapshot.configView",
+          "name": "Controls & Settings",
+          "icon": ""
+        },
+        {
+          "id": "project-snapshot.portView",
+          "name": "Active Ports",
+          "icon": ""
+        }
+      ]
+    },
     "commands": [
       {
         "command": "project-snapshot.generate",
@@ -23,6 +48,29 @@
       {
         "command": "project-snapshot.openInNewWindow",
         "title": "Open in New Window"
+      },
+      {
+        "command": "project-snapshot.openSettings",
+        "title": "Open Ignore Settings",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "project-snapshot.toggleTree",
+        "title": "Toggle Directory Tree"
+      },
+      {
+        "command": "project-snapshot.toggleContents",
+        "title": "Toggle Directory Contents"
+      },
+      {
+        "command": "project-snapshot.refreshPorts",
+        "title": "Refresh Ports",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "project-snapshot.killPort",
+        "title": "Kill Process",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
@@ -48,6 +96,20 @@
         {
           "command": "project-snapshot.generate"
         }
+      ],
+      "view/title": [
+        {
+          "command": "project-snapshot.refreshPorts",
+          "when": "view == project-snapshot.portView",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "project-snapshot.killPort",
+          "when": "view == project-snapshot.portView && viewItem == portItem",
+          "group": "inline"
+        }
       ]
     },
     "configuration": {
@@ -56,29 +118,47 @@
         "projectSnapshot.globalIgnores": {
           "type": "array",
           "default": [
-            "node_modules/**",
-            ".venv/**",
-            "deps/**",
-            ".vsix",
-            ".git/**",
-            "out/**",
-            "dist/**",
-            "build/**",
-            ".vscode/**"
+            "node_modules/",
+            ".venv/",
+            "__pycache__/",
+            "deps/",
+            "*.vsix",
+            ".git/",
+            "out/",
+            "dist/",
+            "build/",
+            ".vscode/",
+            "*.log",
+            "*.lock"
           ],
-          "description": "Global ignore patterns. Evaluated in order. Supports '*' (ignore all) and '!.ext' (un-ignore). Example: ['*', '!.js'] ignores everything EXCEPT JS files."
+          "description": "Global ignore patterns (Gitignore syntax)."
         },
         "projectSnapshot.includedExtensions": {
           "type": "array",
           "default": [
             "*"
           ],
-          "description": "Allowed file extensions (e.g. ['.ts', '.json']). Leave as ['*'] to allow all files that aren't blocked by globalIgnores."
+          "description": "Allowed file extensions (e.g. ['.ts', '.json']). Leave as ['*'] to allow all files."
         },
         "projectSnapshot.notificationTimeout": {
           "type": "number",
           "default": 15000,
-          "description": "Timeout in milliseconds for auto-dismissing information notifications. Set to 0 to disable auto-dismissal."
+          "description": "Timeout in milliseconds for auto-dismissing information notifications."
+        },
+        "projectSnapshot.includeDirectoryTree": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prepend the visual directory tree at the top of the snapshot."
+        },
+        "projectSnapshot.includeFileContents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include the actual contents of the files in the snapshot."
+        },
+        "projectSnapshot.maxFileSizeKB": {
+          "type": "number",
+          "default": 10000,
+          "description": "Maximum file size in KB to include. Files larger than this will be skipped to protect LLM context windows."
         }
       }
     }
@@ -88,6 +168,9 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile"
+  },
+  "dependencies": {
+    "ignore": "^7.0.5"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
